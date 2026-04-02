@@ -1,13 +1,15 @@
 import argparse
 import os
 
+import faiss
 import numpy as np
 import torch
-import faiss
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
 from tqdm import tqdm
 
-from model import FashionEncoder, WEIGHTS
+from model import FashionEncoder
 
 
 def get_device() -> torch.device:
@@ -18,10 +20,22 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def _build_transform() -> transforms.Compose:
+    return transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+
 class CatalogDataset(Dataset):
     def __init__(self, image_root: str):
-        self.transform = WEIGHTS.transforms()
+        self.transform = _build_transform()
         images_dir = os.path.join(image_root, "images")
+
+        if not os.path.isdir(images_dir):
+            raise FileNotFoundError(f"images/ not found at: {images_dir}")
 
         self.records: list[tuple[str, int]] = []
         for sub in sorted(os.listdir(images_dir)):
@@ -29,31 +43,35 @@ class CatalogDataset(Dataset):
             if not os.path.isdir(sub_path):
                 continue
             for fname in os.listdir(sub_path):
-                if not fname.lower().endswith(".jpg"):
-                    continue
-                self.records.append((os.path.join(sub_path, fname), int(os.path.splitext(fname)[0])))
+                if fname.lower().endswith(".jpg"):
+                    self.records.append((
+                        os.path.join(sub_path, fname),
+                        int(os.path.splitext(fname)[0]),
+                    ))
+
+        print(f"[CatalogDataset] {len(self.records)} images found")
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, idx: int):
-        from PIL import Image
         path, article_id = self.records[idx]
-        return self.transform(Image.open(path).convert("RGB")), article_id
+        img = Image.open(path).convert("RGB")
+        return self.transform(img), article_id
 
 
 def extract(checkpoint_path: str, image_root: str, output_dir: str, batch_size: int) -> None:
-    device = get_device()
+    device  = get_device()
     use_amp = device.type == "cuda"
+    print(f"Device: {device}")
 
     ckpt = torch.load(checkpoint_path, map_location=device)
-    cfg = ckpt["config"]
+    cfg  = ckpt["config"]
     embedding_dim: int = cfg["embedding_dim"]
 
     model = FashionEncoder(embedding_dim=embedding_dim, freeze_backbone=False)
     model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device)
-    model.eval()
+    model.to(device).eval()
 
     dataloader = DataLoader(
         CatalogDataset(image_root=image_root),
@@ -63,28 +81,31 @@ def extract(checkpoint_path: str, image_root: str, output_dir: str, batch_size: 
         pin_memory=(device.type == "cuda"),
     )
 
-    all_embeddings: list[np.ndarray] = []
-    all_article_ids: list[int] = []
+    all_embeddings:  list[np.ndarray] = []
+    all_article_ids: list[int]        = []
 
     with torch.no_grad():
-        for batch_imgs, batch_ids in tqdm(dataloader, desc="Extracting embeddings"):
+        for batch_imgs, batch_ids in tqdm(dataloader, desc="Extracting"):
             batch_imgs = batch_imgs.to(device)
             with torch.autocast(device_type="cuda", enabled=use_amp):
                 embeddings = model(batch_imgs)
             all_embeddings.append(embeddings.cpu().numpy())
             all_article_ids.extend(batch_ids.numpy().tolist())
 
-    embeddings_array = np.concatenate(all_embeddings, axis=0).astype(np.float32)
+    embeddings_array  = np.concatenate(all_embeddings, axis=0).astype(np.float32)
     article_ids_array = np.array(all_article_ids, dtype=np.int64)
 
     os.makedirs(output_dir, exist_ok=True)
+
     npz_path = os.path.join(output_dir, "embeddings.npz")
     np.savez(npz_path, embeddings=embeddings_array, article_ids=article_ids_array)
+    print(f"Saved: {npz_path}")
 
     index = faiss.IndexFlatIP(embedding_dim)
     index.add(embeddings_array)
     index_path = os.path.join(output_dir, "embeddings.faiss")
     faiss.write_index(index, index_path)
+    print(f"FAISS index saved: {index_path} ({index.ntotal} vectors)")
 
 
 if __name__ == "__main__":
@@ -95,4 +116,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=256)
     args = parser.parse_args()
 
-    extract(checkpoint_path=args.checkpoint, image_root=args.image_root, output_dir=args.output_dir, batch_size=args.batch_size)
+    extract(
+        checkpoint_path=args.checkpoint,
+        image_root=args.image_root,
+        output_dir=args.output_dir,
+        batch_size=args.batch_size,
+    )

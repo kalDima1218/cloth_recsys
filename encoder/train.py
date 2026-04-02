@@ -13,17 +13,17 @@ from model import FashionEncoder
 
 @dataclass
 class Config:
-    image_root: str = ".."
-    articles_csv: str = "../articles.csv"
-    embedding_dim: int = 512
-    freeze_backbone: bool = True
-    batch_size: int = 32
-    epochs: int = 50
-    lr: float = 1e-4
-    margin: float = 0.2
-    num_workers: int = 0
-    seed: int = 42
-    checkpoint_dir: str = "../checkpoints"
+    image_root:      str   = ".."
+    articles_csv:    str   = "../articles.csv"
+    embedding_dim:   int   = 512
+    freeze_backbone: bool  = True
+    batch_size:      int   = 32
+    epochs:          int   = 50
+    lr:              float = 1e-4
+    margin:          float = 0.2
+    num_workers:     int   = 0
+    seed:            int   = 42
+    checkpoint_dir:  str   = "../checkpoints"
 
 
 def get_device() -> torch.device:
@@ -38,10 +38,10 @@ def train(cfg: Config) -> None:
     torch.manual_seed(cfg.seed)
     random.seed(cfg.seed)
 
-    device = get_device()
-    print(f"[train] Device: {device}")
-
+    device  = get_device()
     use_amp = device.type == "cuda"
+    print(f"Device: {device}")
+
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
 
     dataset = HMDataset(articles_csv=cfg.articles_csv, image_root=cfg.image_root, seed=cfg.seed)
@@ -53,12 +53,11 @@ def train(cfg: Config) -> None:
         pin_memory=(device.type == "cuda"),
         drop_last=True,
     )
-    print(f"[train] Batches per epoch: {len(dataloader)}")
 
     model = FashionEncoder(embedding_dim=cfg.embedding_dim, freeze_backbone=cfg.freeze_backbone).to(device)
     optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=cfg.lr)
     criterion = nn.TripletMarginLoss(margin=cfg.margin, p=2, reduction="mean")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler    = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
@@ -74,27 +73,31 @@ def train(cfg: Config) -> None:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            running_loss += loss.item()
 
+            running_loss += loss.item()
             if batch_idx % 50 == 0:
                 print(f"Epoch {epoch}/{cfg.epochs} | Batch {batch_idx}/{len(dataloader)} | Loss {loss.item():.4f}")
 
         avg_loss = running_loss / len(dataloader)
-        print(f"Epoch {epoch}/{cfg.epochs} complete | Avg Loss {avg_loss:.4f}")
+        print(f"Epoch {epoch}/{cfg.epochs} | Avg Loss {avg_loss:.4f}")
 
         ckpt_path = os.path.join(cfg.checkpoint_dir, f"epoch_{epoch}.pt")
-        torch.save({
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "loss": avg_loss,
-            "config": dataclasses.asdict(cfg),
-        }, ckpt_path)
-        print(f"Checkpoint saved: {ckpt_path}")
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "loss": avg_loss,
+                "config": dataclasses.asdict(cfg),
+            },
+            ckpt_path,
+        )
 
-    final_path = os.path.join(cfg.checkpoint_dir, "model_final.pt")
-    torch.save({"model_state_dict": model.state_dict(), "config": dataclasses.asdict(cfg)}, final_path)
-    print(f"Final model saved: {final_path}")
+    torch.save(
+        {"model_state_dict": model.state_dict(), "config": dataclasses.asdict(cfg)},
+        os.path.join(cfg.checkpoint_dir, "model_final.pt"),
+    )
+    print(f"Saved: {os.path.join(cfg.checkpoint_dir, 'model_final.pt')}")
 
 
 if __name__ == "__main__":

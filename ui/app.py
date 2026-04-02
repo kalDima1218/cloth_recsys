@@ -6,7 +6,6 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT / "engine"))
@@ -16,8 +15,9 @@ from engine import FashionEngine
 DATA_ROOT        = _PROJECT_ROOT
 ARTICLES_CSV     = DATA_ROOT / "articles.csv"
 TRANSACTIONS_CSV = DATA_ROOT / "transactions_train.csv"
-EMBEDDINGS_NPZ   = DATA_ROOT / "outputs" / "embeddings.npz"
 ENGINE_CACHE     = DATA_ROOT / "engine_cache"
+RANKER_MODEL     = DATA_ROOT / "ranker" / "model.cbm"
+RANKER_LOOKUP    = DATA_ROOT / "ranker" / "lookup_meta.pkl"
 
 COLD_START_N = 10
 GRID_COLS    = 4
@@ -30,21 +30,23 @@ def article_image_path(article_id: int) -> Path:
     return DATA_ROOT / "images" / s[:3] / f"{s}.jpg"
 
 
-def load_image(article_id: int) -> Optional[Image.Image]:
-    try:
-        return Image.open(article_image_path(article_id)).convert("RGB")
-    except (FileNotFoundError, OSError):
-        return None
+def load_image(article_id: int) -> Optional[str]:
+    path = article_image_path(article_id)
+    return str(path) if path.exists() else None
 
 
-@st.cache_resource(show_spinner="Загрузка FAISS-индексов...")
+@st.cache_resource(show_spinner="Загрузка индексов...")
 def load_engine() -> FashionEngine:
-    if (ENGINE_CACHE / "item.faiss").exists():
-        return FashionEngine.load(str(ENGINE_CACHE))
-    if not EMBEDDINGS_NPZ.exists():
-        st.error(f"Не найден файл эмбеддингов: **{EMBEDDINGS_NPZ}**")
-        st.stop()
-    return FashionEngine(str(EMBEDDINGS_NPZ), str(TRANSACTIONS_CSV))
+    return FashionEngine.load(str(ENGINE_CACHE))
+
+
+@st.cache_resource(show_spinner="Загрузка модели ранжирования...")
+def load_ranker():
+    if not (RANKER_MODEL.exists() and RANKER_LOOKUP.exists()):
+        return None
+    sys.path.insert(0, str(_PROJECT_ROOT / "ranker"))
+    from ranker import FashionRanker
+    return FashionRanker(str(RANKER_MODEL), str(RANKER_LOOKUP))
 
 
 @st.cache_data(show_spinner=False)
@@ -55,28 +57,29 @@ def load_articles() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def load_prices() -> Dict[int, float]:
-    if not TRANSACTIONS_CSV.exists():
-        return {}
     df = pd.read_csv(TRANSACTIONS_CSV, usecols=["article_id", "price"])
     return df.groupby("article_id")["price"].mean().to_dict()
 
 
 def _sample_random_batch(engine: FashionEngine, n: int = BATCH_N) -> List[int]:
     seen = set(st.session_state.pool)
-    candidates = [aid for aid in engine._art_id_to_idx.keys()
-                  if aid not in seen and article_image_path(aid).exists()]
+    candidates = [
+        aid for aid in engine._art_id_to_idx.keys()
+        if aid not in seen and article_image_path(aid).exists()
+    ]
     return random.sample(candidates, min(n, len(candidates)))
 
 
 def _build_cold_start_pool(engine: FashionEngine) -> List[int]:
-    articles = load_articles()
-    df = articles[articles.index.isin(engine._art_id_to_idx.keys())].copy()
+    articles  = load_articles()
+    known_ids = set(engine._art_id_to_idx.keys())
+
+    df = articles[articles.index.isin(known_ids)].copy()
     df = df[df.index.map(lambda aid: article_image_path(int(aid)).exists())]
 
-    if TRANSACTIONS_CSV.exists():
-        counts = pd.read_csv(TRANSACTIONS_CSV, usecols=["article_id"])["article_id"].value_counts()
-        df["_pop"] = df.index.map(counts).fillna(0)
-        df = df.sort_values("_pop", ascending=False).head(5_000)
+    counts = pd.read_csv(TRANSACTIONS_CSV, usecols=["article_id"])["article_id"].value_counts()
+    df["_pop"] = df.index.map(counts).fillna(0)
+    df = df.sort_values("_pop", ascending=False).head(5_000)
 
     groups = df["product_group_name"].unique().tolist()
     random.shuffle(groups)
@@ -106,11 +109,12 @@ def init_session() -> None:
         st.session_state.disliked_ids = []
         st.session_state.style_limit  = RECS_PER_TAB
         st.session_state.look_limit   = RECS_PER_TAB
+        st.session_state.ranked_limit = RECS_PER_TAB
 
 
 def _article_info(article_id: int, articles: pd.DataFrame, prices: Dict) -> Dict:
     try:
-        row = articles.loc[int(article_id)]
+        row      = articles.loc[int(article_id)]
         name     = row["prod_name"]
         category = row.get("product_type_name") or row.get("product_group_name") or "—"
     except KeyError:
@@ -137,8 +141,14 @@ def render_swipe_card(article_id: int, articles: pd.DataFrame, prices: Dict) -> 
 
     with info_col:
         st.markdown(f"## {info['name']}")
-        st.markdown(f"<span style='color:#888;font-size:.9rem'>{info['category']}</span>", unsafe_allow_html=True)
-        st.markdown(f"<small style='color:#bbb'>article_id: {article_id}</small>", unsafe_allow_html=True)
+        st.markdown(
+            f"<span style='color:#888;font-size:.9rem'>{info['category']}</span>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<small style='color:#bbb'>article_id: {article_id}</small>",
+            unsafe_allow_html=True,
+        )
         st.markdown("<br>" * 3, unsafe_allow_html=True)
 
         like_col, dislike_col = st.columns(2, gap="small")
@@ -204,11 +214,11 @@ def render_recommendations(engine: FashionEngine, articles: pd.DataFrame, prices
         return
 
     st.markdown("---")
-    tab_style, tab_look = st.tabs(["👗 Ваш стиль", "🛍 С этим сочетают"])
+    tab_style, tab_look, tab_ranked = st.tabs(["👗 Ваш стиль", "🛍 С этим сочетают", "🤖 AI Подбор"])
     seen = set(liked) | set(st.session_state.disliked_ids)
 
     with tab_style:
-        st.markdown("##### Похожие вещи — от каждой понравившейся")
+        st.markdown("##### Похожие вещи — цепочка от понравившихся")
         valid_liked = [a for a in liked if a in engine._art_id_to_idx]
         if valid_liked:
             limit        = st.session_state.style_limit
@@ -245,9 +255,28 @@ def render_recommendations(engine: FashionEngine, articles: pd.DataFrame, prices
             st.session_state.look_limit += RECS_PER_TAB
             st.rerun()
 
+    with tab_ranked:
+        ranker = load_ranker()
+        if ranker is None:
+            st.info("Модель ранжирования не обучена. Запустите: `python ranker/train.py`")
+        else:
+            st.markdown("##### Персональный подбор на основе обученной модели")
+            limit   = st.session_state.ranked_limit
+            results = engine.get_ranked_recommendations(liked, top_k=limit + 10)
+            results = [a for a in results if a not in seen][:limit]
+            render_product_grid(results, articles, prices, key_prefix="ranked")
+            if st.button("Показать ещё", key="more_ranked"):
+                st.session_state.ranked_limit += RECS_PER_TAB
+                st.rerun()
+
 
 def main() -> None:
-    st.set_page_config(page_title="Fashion Tinder", page_icon="👗", layout="centered", initial_sidebar_state="collapsed")
+    st.set_page_config(
+        page_title="Fashion Tinder",
+        page_icon="👗",
+        layout="centered",
+        initial_sidebar_state="collapsed",
+    )
 
     st.markdown(
         """
@@ -267,7 +296,8 @@ def main() -> None:
 
     st.markdown(
         "<h1 style='text-align:center;margin-bottom:0'>👗 Fashion Tinder</h1>"
-        "<p style='text-align:center;color:#888;margin-top:4px'>Оцените вещи — получите персональные рекомендации</p>",
+        "<p style='text-align:center;color:#888;margin-top:4px'>"
+        "Оцените вещи — получите персональные рекомендации</p>",
         unsafe_allow_html=True,
     )
     st.markdown("---")
@@ -275,6 +305,10 @@ def main() -> None:
     engine   = load_engine()
     articles = load_articles()
     prices   = load_prices()
+
+    ranker = load_ranker()
+    if ranker is not None:
+        engine.set_ranker(ranker)
 
     init_session()
 
@@ -288,7 +322,10 @@ def main() -> None:
     else:
         liked_n    = len(st.session_state.liked_ids)
         disliked_n = len(st.session_state.disliked_ids)
-        st.success(f"✅ Пул оценён! Понравилось: **{liked_n}**, пропущено: **{disliked_n}**. Посмотрите рекомендации ниже или загрузите ещё вещи.")
+        st.success(
+            f"✅ Пул оценён! Понравилось: **{liked_n}**, пропущено: **{disliked_n}**. "
+            "Посмотрите рекомендации ниже или загрузите ещё вещи."
+        )
         if st.button("🔄  Ещё вещей", type="primary", width="content"):
             st.session_state.pool.extend(_sample_random_batch(engine))
             st.rerun()

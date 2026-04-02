@@ -6,12 +6,19 @@ import pandas as pd
 from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset
+from torchvision import transforms
 
-from model import WEIGHTS
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 
-def build_transform():
-    return WEIGHTS.transforms()
+def build_transform() -> transforms.Compose:
+    return transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
+    ])
 
 
 def article_id_to_path(article_id: int, image_root: str) -> str:
@@ -29,12 +36,11 @@ class HMDataset(Dataset):
     ):
         random.seed(seed)
         self.image_root = image_root
-        self.transform = transform or build_transform()
+        self.transform  = transform or build_transform()
 
         df = pd.read_csv(articles_csv, usecols=["article_id", "product_code"])
         df["path"] = df["article_id"].apply(lambda aid: article_id_to_path(aid, image_root))
-        mask_exists = df["path"].apply(os.path.exists)
-        df = df[mask_exists].reset_index(drop=True)
+        df = df[df["path"].apply(os.path.exists)].reset_index(drop=True)
 
         groups: Dict[int, List[int]] = {}
         for row in df.itertuples(index=False):
@@ -43,6 +49,9 @@ class HMDataset(Dataset):
         self.product_groups: Dict[int, List[int]] = {
             pc: ids for pc, ids in groups.items() if len(ids) >= 2
         }
+
+        if len(self.product_groups) < 2:
+            raise ValueError(f"Need at least 2 valid product codes, found {len(self.product_groups)}")
 
         self.valid_product_codes: List[int] = list(self.product_groups.keys())
 
@@ -61,6 +70,5 @@ class HMDataset(Dataset):
         return self._load(anchor_id), self._load(pos_id), self._load(neg_id)
 
     def _load(self, article_id: int) -> Tensor:
-        path = article_id_to_path(article_id, self.image_root)
-        img = Image.open(path).convert("RGB")
+        img = Image.open(article_id_to_path(article_id, self.image_root)).convert("RGB")
         return self.transform(img)
