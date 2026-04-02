@@ -91,8 +91,8 @@ streamlit run ui/app.py
 
 ## Технологии
 
-- **PyTorch** — модель и обучение encoder
-- **FAISS** — точный поиск ближайших соседей
-- **CatBoost** — обученная модель ранжирования (YetiRank)
+- **PyTorch** — модель encoder
+- **FAISS** — поиск ближайших соседей
+- **CatBoost** — модель ранжирования
 - **pandas**, **numpy** — обработка данных
 - **Streamlit** — веб-интерфейс
